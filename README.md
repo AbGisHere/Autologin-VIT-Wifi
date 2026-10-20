@@ -12,8 +12,8 @@ up again on their own. It uses only tools macOS already ships with.
 
 ## Features
 
-- **Fast:** notices within a second when the Wi-Fi gets an address or the Mac wakes, signs in
-  straight away and retries every second while the network is still coming up.
+- **Fast:** macOS tells it the moment the Wi-Fi comes back or the Mac wakes; it signs in straight
+  away and retries every second while the network is still coming up.
 - **Hands-off:** starts at login and after a restart, and launchd restarts it if it ever stops.
   No app to open, no terminal to keep open.
 - **Gets past the macOS sign-in window:** macOS holds the hostel Wi-Fi back from other apps until
@@ -72,9 +72,10 @@ Example log, `~/Library/Logs/autologin-vit-wifi.log`:
 
 ## How it works
 
-The LaunchAgent runs `autologin-vit-wifi.sh --watch`, a loop that wakes once a second and asks
-macOS for the Wi-Fi address (one `ipconfig` call, nothing on the network). When the address
-changes, or the Mac has just woken up, it runs a check at once, and then again every second for
+The LaunchAgent runs `autologin-vit-wifi.sh --watch`. It asks macOS (through `scutil`, which
+ships with it) to report every change to the Wi-Fi's link, address and captive-portal state and
+to the default route, so it hears about the Wi-Fi coming back the moment macOS does, without
+polling. On a change, or when the Mac has just woken up, it runs a check at once, and then again every second for
 30 seconds while the network is still coming up. Otherwise it runs a check every 10 seconds.
 
 Each check takes well under a second when you are online:

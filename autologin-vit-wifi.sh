@@ -1,9 +1,9 @@
 #!/bin/bash
 # Autologin-VIT-Wifi: keeps a Mac signed in to the VIT hostel Wi-Fi (Pronto sign-in page).
 #
-# A LaunchAgent (see install.sh) keeps "--watch" running. It notices within a second when the
-# Wi-Fi gets an address or the Mac wakes, and then runs a check at once, retrying every second
-# while the network is still coming up; otherwise it checks every 10 s. Each check:
+# A LaunchAgent (see install.sh) keeps "--watch" running. macOS tells it the moment the Wi-Fi
+# changes (link, address or captive-portal state), and it runs a check at once, retrying every
+# second while the network is still coming up; otherwise it checks every 10 s. Each check:
 #   1. runs a reach test against http://clients3.google.com/generate_204; HTTP 204 means the
 #      internet is reachable, so it exits
 #   2. otherwise checks that the thing in the way is the VIT sign-in page, so the password is
@@ -134,9 +134,21 @@ rejoin_wifi() {
   networksetup -setairportpower "$WIFI_IF" on
 }
 
-# --watch: a cheap loop (one ipconfig call per second) that runs a full check in a child process
-# as soon as the Wi-Fi gets a new address or the Mac wakes, then every second while the network
-# is still coming up (offline / no-reply), and every CHECK_EVERY_S otherwise. Fast retries are
+# Prints a "changedKey" line the moment macOS changes the Wi-Fi's link, address or captive-portal
+# state (CaptiveNetwork is where macOS records that it found a sign-in page), or the default
+# route. The blank line every minute is ignored by scutil; once scutil or this script is gone,
+# writing it fails or the loop ends, so nothing is left behind.
+watch_network_changes() {
+  {
+    printf 'n.add State:/Network/Interface/%s/%s\n' "$WIFI_IF" Link "$WIFI_IF" IPv4 "$WIFI_IF" CaptiveNetwork
+    printf 'n.add State:/Network/Global/IPv4\nn.watch\n'
+    while kill -0 $$ 2>/dev/null; do sleep 60; echo; done
+  } | scutil
+}
+
+# --watch: a cheap loop that waits on watch_network_changes and runs a full check in a child
+# process the moment the Wi-Fi changes or the Mac wakes, then every second while the network is
+# still coming up (offline / no-reply), and every CHECK_EVERY_S otherwise. Fast retries are
 # only for those two states: "waiting" needs a few seconds for macOS to let go, and two quick
 # "waiting" runs in a row would count as a rejected sign-in.
 #
@@ -145,14 +157,27 @@ rejoin_wifi() {
 # to do but hold the network back from other apps. If macOS still holds the network HOLD_S after
 # the sign-in, it rejoins the Wi-Fi once.
 if [ $WATCH = 1 ]; then
-  last_ip="-"; next_check=0; burst_until=0; settled_for=""
+  next_check=0; burst_until=0; settled_for=""; watcher=""; changed=0
+  events="$STATE_DIR/events"
+  trap '[ -n "$watcher" ] && pkill -P "$watcher"; [ -n "$watcher" ] && kill "$watcher" 2>/dev/null' EXIT
+  trap 'exit 0' TERM INT HUP
   while true; do
+    # (Re)start the watcher. It only stops if scutil does, so this is normally once.
+    if [ -z "$watcher" ] || ! kill -0 "$watcher" 2>/dev/null; then
+      [ -n "$watcher" ] && sleep 1
+      exec 3<&-
+      rm -f "$events" && mkfifo "$events"
+      watch_network_changes > "$events" &
+      watcher=$!
+      exec 3< "$events"
+    fi
+
     now=$(date +%s)
-    ip=$(ipconfig getifaddr "$WIFI_IF" 2>/dev/null)
-    if [ "$ip" != "$last_ip" ]; then
-      last_ip=$ip
-      next_check=0
-      [ -n "$ip" ] && burst_until=$((now + BURST_S))
+    if [ $changed = 1 ]; then
+      changed=0
+      # Not after a "waiting" check: a second one straight away would count as a rejection.
+      [ "$(cat "$STATE_DIR/state" 2>/dev/null)" != waiting ] && next_check=0
+      burst_until=$((now + BURST_S))
     fi
 
     if [ "$now" -ge "$next_check" ]; then
@@ -177,7 +202,12 @@ if [ $WATCH = 1 ]; then
     fi
 
     before=$(date +%s)
-    sleep $nap
+    if [ $nap = 1 ]; then
+      # Wait up to a second for a change. (bash 3.2 only takes whole seconds here.)
+      read -t 1 -u 3 line && case "$line" in *changedKey*) changed=1 ;; esac
+    else
+      sleep $nap
+    fi
     # A long sleep means the Mac was asleep: check now, and retry fast while the Wi-Fi rejoins.
     if [ $(($(date +%s) - before)) -gt 5 ]; then
       next_check=0
