@@ -1,18 +1,20 @@
 # Autologin-VIT-Wifi
 
-Version 1.0.0
+Version 1.1.0
 
 A tiny macOS background agent that keeps a Mac signed in to the VIT hostel Wi-Fi.
 
 The hostel network sits behind a Pronto sign-in page: every time the connection drops, or the
 Wi-Fi comes back after the nightly 1:30-3:30 AM shutdown, you have to open that page and type
-your registration number and password again. This agent signs you back in about 25 seconds
-after the Wi-Fi returns, so downloads, cloud notebooks and anything else running overnight pick
+your registration number and password again. This agent signs you back in within a few seconds
+of the Wi-Fi returning, so downloads, cloud notebooks and anything else running overnight pick
 up again on their own. It uses only tools macOS already ships with.
 
 ## Features
 
-- **Hands-off:** runs every 10 seconds, on every network change, at login and after a restart.
+- **Fast:** notices within a second when the Wi-Fi gets an address or the Mac wakes, signs in
+  straight away and retries every second while the network is still coming up.
+- **Hands-off:** starts at login and after a restart, and launchd restarts it if it ever stops.
   No app to open, no terminal to keep open.
 - **Gets past the macOS sign-in window:** macOS holds the hostel Wi-Fi back from other apps until
   its own sign-in window is dealt with. The agent signs in anyway and then closes that window, so
@@ -42,7 +44,7 @@ shown while you type). It then:
 1. stores the password in the login Keychain as `autologin-vit-wifi`
 2. copies the script to `~/Library/Application Support/autologin-vit-wifi/`
 3. installs and starts a LaunchAgent, `~/Library/LaunchAgents/com.local.autologin-vit-wifi.plist`,
-   that runs every 10 seconds and whenever the network changes
+   that keeps the script running in `--watch` mode
 
 macOS may show a "Background Items Added" notification for `bash`. Leave it enabled in
 System Settings > General > Login Items & Extensions, otherwise it will not start after a
@@ -70,7 +72,12 @@ Example log, `~/Library/Logs/autologin-vit-wifi.log`:
 
 ## How it works
 
-Each run takes well under a second when you are online:
+The LaunchAgent runs `autologin-vit-wifi.sh --watch`, a loop that wakes once a second and asks
+macOS for the Wi-Fi address (one `ipconfig` call, nothing on the network). When the address
+changes, or the Mac has just woken up, it runs a check at once, and then again every second for
+30 seconds while the network is still coming up. Otherwise it runs a check every 10 seconds.
+
+Each check takes well under a second when you are online:
 
 1. **Reach test.** Request `http://clients3.google.com/generate_204` over the Wi-Fi interface. A
    real internet connection answers HTTP 204, so the agent stops there. Right after the Wi-Fi
@@ -98,9 +105,14 @@ If the sign-in gets no answer at all, the Wi-Fi is still coming up, so it simply
 the next check, without a cooldown. The same goes for no network at all, as during the night
 shutdown.
 
-Typical timing, measured on the hostel network: macOS rejoins the Wi-Fi in about 8 seconds, the
-agent signs in on its next check, and every app is online again 24 to 27 seconds after the Wi-Fi
-comes back.
+The sign-in can now land before macOS has even opened its sign-in window. So after a sign-in the
+agent waits a few seconds for that window, and for a minute afterwards it closes the window if it
+shows up late. Once you are signed in the window has nothing left to do.
+
+Before 1.1.0 the agent ran every 10 seconds, and launchd will not start a job more often than
+that, so a check that came too early cost another 10 seconds: every app was online again 24 to
+27 seconds after the Wi-Fi came back. Now the sign-in follows as soon as macOS has rejoined the
+Wi-Fi and the portal answers.
 
 ## Troubleshooting
 
@@ -125,9 +137,8 @@ comes back.
   connected.
 - **It handles the sign-in, not the Wi-Fi itself.** macOS rejoins the network on its own when it
   comes back. The one exception is the fallback off/on after a sign-in, described above.
-- **The macOS sign-in window shows for a few seconds** after the Wi-Fi comes back, before the
-  agent signs in. Leave it alone; the agent closes it. If you type into it yourself, that works
-  too.
+- **The macOS sign-in window may flash up** when the Wi-Fi comes back. Leave it alone; the agent
+  closes it. If you type into it yourself, that works too.
 - **The portal is plain HTTP**, the same as the browser sign-in page. That is the portal's design,
   not this tool's.
 - **Pronto only.** If VIT changes the portal host or address, update `PORTAL_HOST` and

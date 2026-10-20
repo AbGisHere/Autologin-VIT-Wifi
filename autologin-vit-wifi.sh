@@ -1,7 +1,9 @@
 #!/bin/bash
 # Autologin-VIT-Wifi: keeps a Mac signed in to the VIT hostel Wi-Fi (Pronto sign-in page).
 #
-# Run every 10 s by a LaunchAgent (see install.sh) and on every network change. Each run:
+# A LaunchAgent (see install.sh) keeps "--watch" running. It notices within a second when the
+# Wi-Fi gets an address or the Mac wakes, and then runs a check at once, retrying every second
+# while the network is still coming up; otherwise it checks every 10 s. Each check:
 #   1. runs a reach test against http://clients3.google.com/generate_204; HTTP 204 means the
 #      internet is reachable, so it exits
 #   2. otherwise checks that the thing in the way is the VIT sign-in page, so the password is
@@ -14,19 +16,24 @@
 # The password lives in the macOS login Keychain (service "autologin-vit-wifi"), never in a file.
 #
 #   autologin-vit-wifi.sh            one check, sign in if needed
+#   autologin-vit-wifi.sh --watch    keep checking (what the LaunchAgent runs)
 #   autologin-vit-wifi.sh --dry-run  say what it would do, never send the password
 #   autologin-vit-wifi.sh --status   print the state and the last log lines
 #   autologin-vit-wifi.sh --version  print the version
 
 set -u
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 SERVICE="autologin-vit-wifi"
 PORTAL_HOST="phc.prontonetworks.com"
 PORTAL_IP="172.16.1.1"     # what PORTAL_HOST resolves to on the VIT network
 SIGNIN_PATH="/cgi-bin/authlogin?URI=http://example.com"
 REACH_URL="${REACH_URL:-http://clients3.google.com/generate_204}"
 COOLDOWN_S=120             # pause after a rejected sign-in so a wrong password is not repeated
+CHECK_EVERY_S=10           # --watch: time between checks while nothing changes
+BURST_S=30                 # --watch: after the Wi-Fi comes up, retry every second for this long
+CNA_WATCH_S=60             # --watch: after a sign-in, close a late macOS sign-in window for this long
+CNA="Captive Network Assistant"
 
 STATE_DIR="$HOME/Library/Application Support/autologin-vit-wifi"
 LOG="$HOME/Library/Logs/autologin-vit-wifi.log"
@@ -50,8 +57,10 @@ if [ -f "$LOG" ] && [ "$(wc -l < "$LOG")" -gt 2000 ]; then
 fi
 
 DRY_RUN=0
+WATCH=0
 case "${1:-}" in
   --dry-run) DRY_RUN=1 ;;
+  --watch) WATCH=1 ;;
   --version) echo "Autologin-VIT-Wifi $VERSION"; exit 0 ;;
   --status)
     echo "version: $VERSION"
@@ -62,7 +71,7 @@ case "${1:-}" in
     tail -15 "$LOG" 2>/dev/null
     exit 0 ;;
   "") ;;
-  *) echo "usage: $0 [--dry-run|--status|--version]" >&2; exit 2 ;;
+  *) echo "usage: $0 [--dry-run|--watch|--status|--version]" >&2; exit 2 ;;
 esac
 
 # While macOS shows its own Wi-Fi sign-in window it keeps the network out of the routing table
@@ -71,6 +80,48 @@ esac
 # itself reaches the sign-in page.
 WIFI_IF=$(networksetup -listallhardwareports 2>/dev/null | awk '/^Hardware Port: (Wi-Fi|AirPort)/{getline; print $2; exit}')
 WIFI_IF=${WIFI_IF:-en0}
+
+# --watch: a cheap one-second loop (one ipconfig call) that runs a full check in a child process
+# as soon as the Wi-Fi gets a new address or the Mac wakes, then every second while the network
+# is still coming up (offline / no-reply), and every CHECK_EVERY_S otherwise. Fast retries are
+# only for those two states: "waiting" needs a few seconds for macOS to let go, and two quick
+# "waiting" runs in a row would count as a rejected sign-in.
+if [ $WATCH = 1 ]; then
+  last_ip="-"; next_check=0; burst_until=0
+  while true; do
+    now=$(date +%s)
+    ip=$(ipconfig getifaddr "$WIFI_IF" 2>/dev/null)
+    if [ "$ip" != "$last_ip" ]; then
+      last_ip=$ip
+      next_check=0
+      [ -n "$ip" ] && burst_until=$((now + BURST_S))
+    fi
+
+    if [ "$now" -ge "$next_check" ]; then
+      /bin/bash "$0"
+      now=$(date +%s)
+      case "$(cat "$STATE_DIR/state" 2>/dev/null)" in
+        offline|no-reply) [ "$now" -lt "$burst_until" ] && next_check=$((now + 1)) || next_check=$((now + CHECK_EVERY_S)) ;;
+        *) next_check=$((now + CHECK_EVERY_S)) ;;
+      esac
+    fi
+
+    # macOS can open its sign-in window a moment after we have already signed in. It has nothing
+    # left to do then, and it keeps holding the network for other apps, so close it.
+    signed_in_at=$(cat "$STATE_DIR/signed_in_at" 2>/dev/null || echo 0)
+    if [ $((now - signed_in_at)) -lt $CNA_WATCH_S ] && pgrep -xq "$CNA"; then
+      killall "$CNA" 2>/dev/null && log "closed the macOS sign-in window that opened after the sign-in"
+    fi
+
+    before=$(date +%s)
+    sleep 1
+    # A long sleep means the Mac was asleep: check now, and retry fast while the Wi-Fi rejoins.
+    if [ $(($(date +%s) - before)) -gt 5 ]; then
+      next_check=0
+      burst_until=$(($(date +%s) + BURST_S))
+    fi
+  done
+fi
 wifi_ip=$(ipconfig getifaddr "$WIFI_IF" 2>/dev/null)
 wifi_router=$(ipconfig getoption "$WIFI_IF" router 2>/dev/null)
 IF_OPT=""
@@ -114,15 +165,23 @@ system_online() {
   [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$REACH_URL" 2>/dev/null)" = "204" ]
 }
 release_macos_hold() {
+  # We are signed in, so the window has nothing left to do: close it whether or not macOS still
+  # holds the network. The sign-in can now beat the window, so give it a few seconds to show up
+  # before deciding that it is not the thing holding the network.
+  local i j
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if pgrep -xq "$CNA"; then
+      killall "$CNA" 2>/dev/null
+      for j in 1 2 3 4 5 6 7 8 9 10; do
+        system_online && { log "closed the macOS sign-in window; network released"; return 0; }
+        sleep 0.5
+      done
+      break
+    fi
+    system_online && return 0
+    sleep 0.5
+  done
   system_online && return 0
-  local i
-  if pgrep -xq "Captive Network Assistant"; then
-    killall "Captive Network Assistant" 2>/dev/null
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-      sleep 0.5
-      system_online && { log "closed the macOS sign-in window; network released"; return 0; }
-    done
-  fi
   log "macOS is still holding the network; rejoining Wi-Fi ($WIFI_IF)"
   networksetup -setairportpower "$WIFI_IF" off
   networksetup -setairportpower "$WIFI_IF" on
@@ -135,7 +194,7 @@ if [ "$REACH_CODE" = "204" ]; then
   set_state online
   [ $DRY_RUN = 1 ] && echo "online, nothing to do"
   # A sign-in sent on the last run went through; make sure macOS lets the other apps out too.
-  [ $DRY_RUN = 0 ] && [ "$prev" = "waiting" ] && release_macos_hold
+  [ $DRY_RUN = 0 ] && [ "$prev" = "waiting" ] && date +%s > "$STATE_DIR/signed_in_at" && release_macos_hold
   exit 0
 fi
 
@@ -218,6 +277,7 @@ sleep 1
 reach_test
 if [ "$REACH_CODE" = "204" ]; then
   rm -f "$STATE_DIR/rejected_at"
+  date +%s > "$STATE_DIR/signed_in_at"
   echo online > "$STATE_DIR/state"
   log "signed in as $user (portal HTTP ${code:-none}); internet is back"
   release_macos_hold

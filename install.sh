@@ -2,7 +2,7 @@
 # Installs Autologin-VIT-Wifi for the current macOS user.
 #   1. stores your registration number and password in the login Keychain
 #   2. copies autologin-vit-wifi.sh to ~/Library/Application Support/autologin-vit-wifi/
-#   3. installs a LaunchAgent that runs it every 10 s, on every network change and at login
+#   3. installs a LaunchAgent that keeps it running in --watch mode (from login, restarted if it stops)
 # Re-run it to change the password. Undo everything with uninstall.sh.
 
 set -eu
@@ -42,15 +42,11 @@ cat > "$PLIST" <<EOF
   <array>
     <string>/bin/bash</string>
     <string>$DEST/autologin-vit-wifi.sh</string>
-  </array>
-  <key>StartInterval</key><integer>10</integer>
-  <key>WatchPaths</key>
-  <array>
-    <string>/Library/Preferences/SystemConfiguration</string>
-    <string>/private/var/run/resolv.conf</string>
+    <string>--watch</string>
   </array>
   <key>RunAtLoad</key><true/>
-  <key>ProcessType</key><string>Background</string>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Standard</string>
   <key>StandardErrorPath</key><string>$HOME/Library/Logs/autologin-vit-wifi.err.log</string>
 </dict>
 </plist>
