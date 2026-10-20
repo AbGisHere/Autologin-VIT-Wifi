@@ -23,7 +23,7 @@
 
 set -u
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 SERVICE="autologin-vit-wifi"
 PORTAL_HOST="phc.prontonetworks.com"
 PORTAL_IP="172.16.1.1"     # what PORTAL_HOST resolves to on the VIT network

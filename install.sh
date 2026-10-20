@@ -52,7 +52,13 @@ cat > "$PLIST" <<EOF
 </plist>
 EOF
 
+# bootout returns before a running agent has finished exiting, and bootstrap fails until it has,
+# so wait for the old one to be gone (it stops within a second or two).
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+for _ in $(seq 1 50); do
+  launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break
+  sleep 0.2
+done
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 sleep 3
 echo
