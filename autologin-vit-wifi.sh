@@ -33,6 +33,7 @@ COOLDOWN_S=120             # pause after a rejected sign-in so a wrong password 
 CHECK_EVERY_S=10           # --watch: time between checks while nothing changes
 BURST_S=30                 # --watch: after the Wi-Fi comes up, retry every second for this long
 CNA_WATCH_S=60             # --watch: after a sign-in, close a late macOS sign-in window for this long
+HOLD_S=10                  # --watch: rejoin Wi-Fi if macOS still holds the network this long after it
 CNA="Captive Network Assistant"
 
 STATE_DIR="$HOME/Library/Application Support/autologin-vit-wifi"
@@ -80,48 +81,6 @@ esac
 # itself reaches the sign-in page.
 WIFI_IF=$(networksetup -listallhardwareports 2>/dev/null | awk '/^Hardware Port: (Wi-Fi|AirPort)/{getline; print $2; exit}')
 WIFI_IF=${WIFI_IF:-en0}
-
-# --watch: a cheap one-second loop (one ipconfig call) that runs a full check in a child process
-# as soon as the Wi-Fi gets a new address or the Mac wakes, then every second while the network
-# is still coming up (offline / no-reply), and every CHECK_EVERY_S otherwise. Fast retries are
-# only for those two states: "waiting" needs a few seconds for macOS to let go, and two quick
-# "waiting" runs in a row would count as a rejected sign-in.
-if [ $WATCH = 1 ]; then
-  last_ip="-"; next_check=0; burst_until=0
-  while true; do
-    now=$(date +%s)
-    ip=$(ipconfig getifaddr "$WIFI_IF" 2>/dev/null)
-    if [ "$ip" != "$last_ip" ]; then
-      last_ip=$ip
-      next_check=0
-      [ -n "$ip" ] && burst_until=$((now + BURST_S))
-    fi
-
-    if [ "$now" -ge "$next_check" ]; then
-      /bin/bash "$0"
-      now=$(date +%s)
-      case "$(cat "$STATE_DIR/state" 2>/dev/null)" in
-        offline|no-reply) [ "$now" -lt "$burst_until" ] && next_check=$((now + 1)) || next_check=$((now + CHECK_EVERY_S)) ;;
-        *) next_check=$((now + CHECK_EVERY_S)) ;;
-      esac
-    fi
-
-    # macOS can open its sign-in window a moment after we have already signed in. It has nothing
-    # left to do then, and it keeps holding the network for other apps, so close it.
-    signed_in_at=$(cat "$STATE_DIR/signed_in_at" 2>/dev/null || echo 0)
-    if [ $((now - signed_in_at)) -lt $CNA_WATCH_S ] && pgrep -xq "$CNA"; then
-      killall "$CNA" 2>/dev/null && log "closed the macOS sign-in window that opened after the sign-in"
-    fi
-
-    before=$(date +%s)
-    sleep 1
-    # A long sleep means the Mac was asleep: check now, and retry fast while the Wi-Fi rejoins.
-    if [ $(($(date +%s) - before)) -gt 5 ]; then
-      next_check=0
-      burst_until=$(($(date +%s) + BURST_S))
-    fi
-  done
-fi
 wifi_ip=$(ipconfig getifaddr "$WIFI_IF" 2>/dev/null)
 wifi_router=$(ipconfig getoption "$WIFI_IF" router 2>/dev/null)
 IF_OPT=""
@@ -164,28 +123,68 @@ system_online() {
   # A plain request, with the system's own routing and DNS, is what every other app sees.
   [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$REACH_URL" 2>/dev/null)" = "204" ]
 }
+# Called right after a sign-in. Never waits: if the window is up, close it now. A window that
+# opens later, and the rare case where macOS keeps holding the network, are left to --watch.
 release_macos_hold() {
-  # We are signed in, so the window has nothing left to do: close it whether or not macOS still
-  # holds the network. The sign-in can now beat the window, so give it a few seconds to show up
-  # before deciding that it is not the thing holding the network.
-  local i j
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    if pgrep -xq "$CNA"; then
-      killall "$CNA" 2>/dev/null
-      for j in 1 2 3 4 5 6 7 8 9 10; do
-        system_online && { log "closed the macOS sign-in window; network released"; return 0; }
-        sleep 0.5
-      done
-      break
-    fi
-    system_online && return 0
-    sleep 0.5
-  done
-  system_online && return 0
+  pgrep -xq "$CNA" && killall "$CNA" 2>/dev/null && log "closed the macOS sign-in window"
+}
+rejoin_wifi() {
   log "macOS is still holding the network; rejoining Wi-Fi ($WIFI_IF)"
   networksetup -setairportpower "$WIFI_IF" off
   networksetup -setairportpower "$WIFI_IF" on
 }
+
+# --watch: a cheap loop (one ipconfig call per second) that runs a full check in a child process
+# as soon as the Wi-Fi gets a new address or the Mac wakes, then every second while the network
+# is still coming up (offline / no-reply), and every CHECK_EVERY_S otherwise. Fast retries are
+# only for those two states: "waiting" needs a few seconds for macOS to let go, and two quick
+# "waiting" runs in a row would count as a rejected sign-in.
+#
+# For CNA_WATCH_S after a sign-in it looks for the macOS sign-in window five times a second and
+# closes it the moment it appears: the sign-in can beat the window, which then has nothing left
+# to do but hold the network back from other apps. If macOS still holds the network HOLD_S after
+# the sign-in, it rejoins the Wi-Fi once.
+if [ $WATCH = 1 ]; then
+  last_ip="-"; next_check=0; burst_until=0; settled_for=""
+  while true; do
+    now=$(date +%s)
+    ip=$(ipconfig getifaddr "$WIFI_IF" 2>/dev/null)
+    if [ "$ip" != "$last_ip" ]; then
+      last_ip=$ip
+      next_check=0
+      [ -n "$ip" ] && burst_until=$((now + BURST_S))
+    fi
+
+    if [ "$now" -ge "$next_check" ]; then
+      /bin/bash "$0"
+      now=$(date +%s)
+      case "$(cat "$STATE_DIR/state" 2>/dev/null)" in
+        offline|no-reply) [ "$now" -lt "$burst_until" ] && next_check=$((now + 1)) || next_check=$((now + CHECK_EVERY_S)) ;;
+        *) next_check=$((now + CHECK_EVERY_S)) ;;
+      esac
+    fi
+
+    nap=1
+    signed_in_at=$(cat "$STATE_DIR/signed_in_at" 2>/dev/null || echo 0)
+    since=$((now - signed_in_at))
+    if [ $since -lt $CNA_WATCH_S ]; then
+      nap=0.2
+      pgrep -xq "$CNA" && killall "$CNA" 2>/dev/null && log "closed the macOS sign-in window"
+      if [ $since -ge $HOLD_S ] && [ "$settled_for" != "$signed_in_at" ]; then
+        settled_for=$signed_in_at
+        system_online || rejoin_wifi
+      fi
+    fi
+
+    before=$(date +%s)
+    sleep $nap
+    # A long sleep means the Mac was asleep: check now, and retry fast while the Wi-Fi rejoins.
+    if [ $(($(date +%s) - before)) -gt 5 ]; then
+      next_check=0
+      burst_until=$(($(date +%s) + BURST_S))
+    fi
+  done
+fi
 
 prev=$(cat "$STATE_DIR/state" 2>/dev/null)
 

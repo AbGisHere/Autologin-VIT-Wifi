@@ -105,9 +105,11 @@ If the sign-in gets no answer at all, the Wi-Fi is still coming up, so it simply
 the next check, without a cooldown. The same goes for no network at all, as during the night
 shutdown.
 
-The sign-in can now land before macOS has even opened its sign-in window. So after a sign-in the
-agent waits a few seconds for that window, and for a minute afterwards it closes the window if it
-shows up late. Once you are signed in the window has nothing left to do.
+The sign-in can now land before macOS has even opened its sign-in window. Nothing waits for it:
+the agent closes the window if it is already open, and for a minute after the sign-in it looks for
+it five times a second and closes it the moment it appears. Once you are signed in the window has
+nothing left to do. If macOS is still holding the network 10 seconds after the sign-in, the agent
+turns Wi-Fi off and on once.
 
 Before 1.1.0 the agent ran every 10 seconds, and launchd will not start a job more often than
 that, so a check that came too early cost another 10 seconds: every app was online again 24 to
